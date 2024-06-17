@@ -46,6 +46,9 @@ class Operator(BenchmarkOperator):
             )
             return (x, w, scales_and_zeros)
 
+        yield args(2**16, 1, 1280, 8192)
+        return
+
         # LLama-2 shapes w/ 8-way tensor parallelism.
         name_to_shapes_70b = {
             "attn.wqkv": (8192, 1280),
@@ -64,6 +67,7 @@ class Operator(BenchmarkOperator):
         _, n = w.size()
         return (B, m, n, k)
 
+    '''
     @register_benchmark(baseline=True)
     def tinygemm(self, x, w, scales_and_zeros):
         x = x.reshape(-1, x.size(-1))
@@ -73,12 +77,23 @@ class Operator(BenchmarkOperator):
         return lambda: torch.ops.aten._weight_int4pack_mm(
             x, w_int4, self.group_size, scales_and_zeros
         )
+    '''
 
     @register_benchmark()
-    def triton(self, x, w, scales_and_zeros):
+    def triton_int8(self, x, w, scales_and_zeros):
         x = x.reshape(-1, x.size(-1))
         w_int4 = pack_2xint4(w).T.contiguous().T
-        return lambda: matmul(x, w_int4)
+        w_int8 = w.to(torch.int8)
+        # w_bf16 = w.to(torch.bfloat16)
+        return lambda: matmul(x, w_int8, use_int8=True)
+
+    @register_benchmark(baseline=True)
+    def triton_bf16(self, x, w, scales_and_zeros):
+        x = x.reshape(-1, x.size(-1))
+        w_int4 = pack_2xint4(w).T.contiguous().T
+        # w_int8 = w.to(torch.int8)
+        w_bf16 = w.to(torch.bfloat16)
+        return lambda: matmul(x, w_bf16, use_int8=False)
 
     @register_metric()
     def best_config(self, fn, inputs, metrics):

@@ -29,6 +29,10 @@ AUTOTUNE_CONFIGS = [
     ),
 ]
 
+AUTOTUNE_CONFIGS = [
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3,
+                   num_warps=8)
+]
 
 @triton.autotune(configs=AUTOTUNE_CONFIGS, key=["M", "N", "K"])
 @triton.jit
@@ -61,6 +65,7 @@ def matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_INT8_WEIGHT: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -91,7 +96,7 @@ def matmul_kernel(
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_ak = tl.arange(0, BLOCK_SIZE_K)
-    offs_bk = tl.arange(0, BLOCK_SIZE_K // 2)
+    offs_bk = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -104,6 +109,7 @@ def matmul_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs)
+        '''
         tl.static_assert(b.dtype == tl.int8)
 
         # Unpack `b` into an fp16 matrix, taking care to sign-extend b_lo.  Use
@@ -119,10 +125,16 @@ def matmul_kernel(
             .permute(0, 2, 1)
             .reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
         )
+        '''
+
+        if USE_INT8_WEIGHT:
+            b_f16 = b.to(tl.bfloat16)
+        else:
+            b_f16 = b
 
         accumulator += tl.dot(a, b_f16)
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk // 2
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
     c = accumulator.to(tl.bfloat16)
 
@@ -133,8 +145,8 @@ def matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul(a, b):
-    assert a.shape[1] == b.shape[0] * 2, "Incompatible dimensions"
+def matmul(a, b, use_int8):
+    # assert a.shape[1] == b.shape[0] * 2, "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     _, N = b.shape
@@ -143,7 +155,7 @@ def matmul(a, b):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    matmul_kernel[grid](
+    ret = matmul_kernel[grid](
         a,
         b,
         c,
@@ -156,7 +168,11 @@ def matmul(a, b):
         b.stride(1),
         c.stride(0),
         c.stride(1),
+        USE_INT8_WEIGHT=use_int8,
     )
+    for ir in ("ttir", "ttgir", "llir", "ptx"):
+        with open(f"/home/dberard/local/scripts/triton/int8mm/{'int8' if use_int8 else 'bf16'}.{ir}", "w") as f:
+            f.write(ret.asm[ir])
     return c
 
 
