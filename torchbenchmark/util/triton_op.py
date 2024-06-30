@@ -743,9 +743,18 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             if set(["latency", "tflops", "speedup", "compile_time"]) & set(
                 self.required_metrics
             ):
-                with torch.cuda.stream(torch.cuda.Stream()):
-                    metrics.latency = triton.testing.do_bench_cudagraph(
+                if getattr(self, "get_cuda_graphs", None):
+                    with torch.cuda.stream(torch.cuda.Stream()):
+                        metrics.latency = triton.testing.do_bench_cudagraph(
+                            fn,
+                            rep=rep,
+                            return_mode="median",
+                            grad_to_none=self.get_grad_to_none(self.example_inputs),
+                        )
+                else:
+                    metrics.latency = triton.testing.do_bench(
                         fn,
+                        warmup=warmup,
                         rep=rep,
                         return_mode="median",
                         grad_to_none=self.get_grad_to_none(self.example_inputs),

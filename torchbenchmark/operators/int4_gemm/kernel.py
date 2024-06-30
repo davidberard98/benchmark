@@ -97,17 +97,24 @@ def matmul_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_ak = tl.arange(0, BLOCK_SIZE_K)
     offs_bk = tl.arange(0, BLOCK_SIZE_K)
+
+    '''
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    '''
+    b_ptrs = b_ptr + (offs_bk[None, :] * stride_bk + offs_bn[:, None] * stride_bn)
+    a_ptrs = a_ptr + (offs_am[None, :] * stride_am + offs_ak[:, None] * stride_ak)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        # a = tl.load(a_ptrs, mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_ak[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs)
         '''
         tl.static_assert(b.dtype == tl.int8)
@@ -132,7 +139,8 @@ def matmul_kernel(
         else:
             b_f16 = b
 
-        accumulator += tl.dot(a, b_f16)
+        # accumulator += tl.dot(a, b_f16)
+        accumulator += tl.dot(b_f16, a)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -140,12 +148,14 @@ def matmul_kernel(
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    # c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + stride_cm * offs_cm[None, :] + stride_cn * offs_cn[:, None]
+    # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    c_mask = (offs_cm[None, :] < M) & (offs_cn[:, None] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul(a, b, use_int8):
+def matmul(a, b, use_int16):
     # assert a.shape[1] == b.shape[0] * 2, "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
@@ -155,24 +165,44 @@ def matmul(a, b, use_int8):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    ret = matmul_kernel[grid](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        c.stride(0),
-        c.stride(1),
-        USE_INT8_WEIGHT=use_int8,
-    )
-    for ir in ("ttir", "ttgir", "llir", "ptx"):
-        with open(f"/home/dberard/local/scripts/triton/int8mm/{'int8' if use_int8 else 'bf16'}.{ir}", "w") as f:
-            f.write(ret.asm[ir])
+    # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3,
+    if use_int16:
+        kernel = triton.compiler.compile("/home/dberard/local/scripts/triton/int8mm/int16.ttgir")
+        ret = kernel[triton.cdiv(M, 128) * triton.cdiv(N, 256), 1, 1](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            # a.stride(1),
+            b.stride(0),
+            # b.stride(1),
+            c.stride(0),
+            # c.stride(1),
+        )
+    else:
+        kernel = matmul_kernel
+        ret = kernel[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            USE_INT8_WEIGHT=use_int16,
+        )
+    if not use_int16:
+        for ir in ("ttir", "ttgir", "llir", "ptx"):
+            with open(f"/home/dberard/local/scripts/triton/int8mm/{'int16' if use_int16 else 'bf16'}.{ir}", "w") as f:
+                f.write(ret.asm[ir])
     return c
 
 
@@ -180,3 +210,14 @@ def pack_2xint4(t):
     # Packs a KxNxfp16 matrix into a (K//2)xNx(2xint4) matrix.
     t = t.to(torch.int8).reshape(t.shape[0] // 2, 2, t.shape[1]).permute(1, 0, 2)
     return (t[0] & 0xF) | (t[1] << 4)
+
+if __name__ == "__main__":
+    import triton.profiler as proton
+
+    a = torch.randn(2**16, 8192, device='cuda', dtype=torch.bfloat16)
+    b = torch.randint(-8, 7, (8192, 1280), device='cuda').to(torch.bfloat16)
+    use_int16 = False
+    session_id = proton.start(name="profile_name", context="python")
+    for _ in range(2):
+        matmul(a, b, use_int16)
+    proton.finalize()

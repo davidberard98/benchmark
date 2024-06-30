@@ -26,6 +26,7 @@ from .kernel import pack_2xint4, matmul, matmul_kernel
 
 class Operator(BenchmarkOperator):
     DEFAULT_METRICS = ["tflops", "gbps", "latency"]
+    use_cuda_graphs = False
 
     def __init__(self, mode, device, extra_args):
         super().__init__(mode=mode, device=device, extra_args=extra_args)
@@ -80,12 +81,12 @@ class Operator(BenchmarkOperator):
     '''
 
     @register_benchmark()
-    def triton_int8(self, x, w, scales_and_zeros):
+    def triton_int16(self, x, w, scales_and_zeros):
         x = x.reshape(-1, x.size(-1))
         w_int4 = pack_2xint4(w).T.contiguous().T
-        w_int8 = w.to(torch.int8)
+        w_int8 = w.to(torch.int8).to(torch.int16)
         # w_bf16 = w.to(torch.bfloat16)
-        return lambda: matmul(x, w_int8, use_int8=True)
+        return lambda: matmul(x, w_int8, use_int16=True)
 
     @register_benchmark(baseline=True)
     def triton_bf16(self, x, w, scales_and_zeros):
@@ -93,7 +94,7 @@ class Operator(BenchmarkOperator):
         w_int4 = pack_2xint4(w).T.contiguous().T
         # w_int8 = w.to(torch.int8)
         w_bf16 = w.to(torch.bfloat16)
-        return lambda: matmul(x, w_bf16, use_int8=False)
+        return lambda: matmul(x, w_bf16, use_int16=False)
 
     @register_metric()
     def best_config(self, fn, inputs, metrics):
