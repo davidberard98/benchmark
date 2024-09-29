@@ -87,9 +87,6 @@ class Operator(BenchmarkOperator):
             "ffn.w2": (3584, 8192),
         }
 
-        yield args(2**16, 1280, 8192)
-        return
-
         for bsz in (1, 4, 16, 64, 256, 1024, 2**12, 2**14, 2**16):
             for name, (k, n) in name_to_shapes_70b.items():
                 yield args(bsz, n, k)
